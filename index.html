@@ -382,9 +382,24 @@ body::before {
 .month-label { font-size: 10px; color: var(--sub); }
 </style>
 <script type="module">
-console.log("Firebase Ready");
-</script>
-</head>
+
+
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.0.0/firebase-app.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyDpY0_uGYHNmPnBQr8panMa1Xivdzj6bY",
+  authDomain: "nafs-tracker-bec0e.firebaseapp.com",
+  projectId: "nafs-tracker-bec0e",
+  storageBucket: "nafs-tracker-bec0e.firebasestorage.app",
+  messagingSenderId: "381978394406",
+  appId: "1:381978394406:web:219099f338c62458064be7",
+  measurementId: "G-YK3H05DMEJ"
+};
+
+const app = initializeApp(firebaseConfig);
+
+console.log("Firebase Connected");
+</script></head>
 <body>
 
 <button id="hamburger" onclick="toggleSidebar()">☰</button>
