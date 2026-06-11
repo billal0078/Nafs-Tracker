@@ -383,8 +383,9 @@ body::before {
 </style>
 <script type="module">
 
-
-import { initializeApp } from "https://www.gstatic.com/firebasejs/12.0.0/firebase-app.js";
+import { initializeApp }                           from "https://www.gstatic.com/firebasejs/12.0.0/firebase-app.js";
+import { getFirestore, doc, setDoc, getDoc, getDocs, collection }
+                                                   from "https://www.gstatic.com/firebasejs/12.0.0/firebase-firestore.js";
 
 const firebaseConfig = {
   apiKey: "AIzaSyDpY0_uGYHNmPnBQr8panMa1Xivdzj6bY",
@@ -397,8 +398,64 @@ const firebaseConfig = {
 };
 
 const app = initializeApp(firebaseConfig);
+const db  = getFirestore(app);
 
-console.log("Firebase Connected");
+// ── CLOUD SYNC HELPERS ────────────────────────────────────────────────
+// Fixed user ID (single-user app; swap for auth UID when auth is added)
+const USER_ID = "default_user";
+
+async function saveToCloud(key, value) {
+  try {
+    // key examples: "nafs_day_2025-06-11" | "nafs_journal_2025-06-11"
+    const safeKey = key.replace(/[^a-zA-Z0-9_\-]/g, "_");
+    await setDoc(doc(db, "nafs_users", USER_ID, "data", safeKey), { value: JSON.stringify(value) });
+  } catch (e) {
+    console.warn("[Nafs Cloud] saveToCloud failed:", e.message);
+  }
+}
+
+async function loadFromCloud(key) {
+  try {
+    const safeKey = key.replace(/[^a-zA-Z0-9_\-]/g, "_");
+    const snap = await getDoc(doc(db, "nafs_users", USER_ID, "data", safeKey));
+    if (snap.exists()) return JSON.parse(snap.data().value);
+  } catch (e) {
+    console.warn("[Nafs Cloud] loadFromCloud failed:", e.message);
+  }
+  return null;
+}
+
+async function loadAllFromCloud() {
+  try {
+    const snap = await getDocs(collection(db, "nafs_users", USER_ID, "data"));
+    snap.forEach(docSnap => {
+      const key = docSnap.id.replace(/_/g, function(m, offset, str) {
+        // Restore hyphens in date portions (conservative: just store back as-is)
+        return m;
+      });
+      // Write into localStorage as offline cache (don't overwrite if already fresher)
+      if (!localStorage.getItem(key)) {
+        try { localStorage.setItem(key, docSnap.data().value); } catch {}
+      }
+    });
+    // Also sync keys that exist in cloud but differ from localStorage
+    snap.forEach(docSnap => {
+      // Cloud is source of truth on startup — overwrite localStorage
+      try { localStorage.setItem(docSnap.id, docSnap.data().value); } catch {}
+    });
+    console.log("[Nafs Cloud] All data loaded from Firestore ✓");
+  } catch (e) {
+    console.warn("[Nafs Cloud] loadAllFromCloud failed (offline?):", e.message);
+  }
+}
+
+// Expose to global scope so the non-module <script> block can call them
+window._nafsDb            = db;
+window._nafsSaveToCloud   = saveToCloud;
+window._nafsLoadFromCloud = loadFromCloud;
+window._nafsLoadAll       = loadAllFromCloud;
+
+console.log("Firebase + Firestore Connected");
 </script></head>
 <body>
 
@@ -419,7 +476,7 @@ console.log("Firebase Connected");
   <div class="nav-section">Personal</div>
   <button class="nav-item" onclick="navigate('journal',this)"><span class="nav-icon">📝</span> Journal</button>
   <button class="nav-item" onclick="navigate('settings',this)"><span class="nav-icon">⚙️</span> Settings</button>
-  <div class="sidebar-bottom">v1.0 · All data local</div>
+  <div class="sidebar-bottom">v1.0 · Cloud Sync ☁️</div>
 </nav>
 
 <!-- MAIN -->
@@ -662,8 +719,8 @@ console.log("Firebase Connected");
       <div class="card-title">About</div>
       <p style="font-size:14px;color:var(--sub);line-height:1.7;">
         <strong style="color:var(--text);">Nafs</strong> — Self-Improvement Tracker<br>
-        All data stored locally in your browser.<br>
-        Works 100% offline. No account needed.
+        Data synced to Firestore ☁️ with localStorage as offline cache.<br>
+        Works offline. No account needed.
       </p>
     </div>
   </div>
@@ -733,12 +790,28 @@ const QUOTES = [
 // ── STORAGE HELPERS ──────────────────────────────────────────────────
 const todayKey = () => new Date().toISOString().slice(0,10);
 
+// load() — reads from localStorage (offline cache, already hydrated from cloud on startup)
 function load(key, def) {
   try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : def; }
   catch { return def; }
 }
+
+// save() — writes to localStorage immediately AND syncs to Firestore in background
 function save(key, val) {
   try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+  // Fire-and-forget cloud sync (cloud helpers available after module script runs)
+  if (window._nafsSaveToCloud) {
+    window._nafsSaveToCloud(key, val).catch(() => {});
+  }
+}
+
+// Named cloud helpers exposed for direct use if needed
+async function saveToCloud(key, value) {
+  if (window._nafsSaveToCloud) return window._nafsSaveToCloud(key, value);
+}
+async function loadFromCloud(key) {
+  if (window._nafsLoadFromCloud) return window._nafsLoadFromCloud(key);
+  return null;
 }
 
 function getDay(dateStr) { return load(`nafs_day_${dateStr}`, {}); }
@@ -1771,7 +1844,7 @@ function setupNetworkIndicator() {
 // ═══════════════════════════════════════════════════════════
 // INIT
 // ═══════════════════════════════════════════════════════════
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
   // Generate icons
   const i192 = generateIcon(192);
   const i512 = generateIcon(512);
@@ -1797,6 +1870,15 @@ document.addEventListener('DOMContentLoaded', () => {
   // Network indicator
   setupNetworkIndicator();
 
+  // ── CLOUD SYNC: load all user data from Firestore into localStorage ──
+  // Wait up to 4 s; if offline, falls through instantly to local data
+  try {
+    await Promise.race([
+      (async () => { if (window._nafsLoadAll) await window._nafsLoadAll(); })(),
+      new Promise(res => setTimeout(res, 4000))
+    ]);
+  } catch {}
+
   // Handle ?page= deep link
   const urlParams = new URLSearchParams(window.location.search);
   const startPage = urlParams.get('page');
@@ -1811,7 +1893,7 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('main').style.paddingBottom = 'max(80px, calc(env(safe-area-inset-bottom) + 80px))';
 });
   // Firebase Auth & Cloud Sync
-console.log("Firebase Ready");
+console.log("Firebase + Firestore Ready");
 </script>
 </body>
 </html>
