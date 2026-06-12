@@ -382,46 +382,77 @@ body::before {
 .month-label { font-size: 10px; color: var(--sub); }
 </style>
 <script type="module">
+// ═══════════════════════════════════════════════════════════════════════
+// FIREBASE — v12 compatible
+// Uses signInWithRedirect (not signInWithPopup) for full compatibility
+// with: Android Chrome, mobile Safari, GitHub Pages, PWA standalone mode.
+//
+// WHY REDIRECT NOT POPUP:
+//   signInWithPopup fails silently on mobile Chrome because:
+//   1. The async setup before window.open() breaks the user-gesture chain,
+//      causing the browser to treat it as an unsolicited popup and block it.
+//   2. In PWA standalone mode there is no parent window for postMessage.
+//   3. GitHub Pages is on a different origin from the Firebase auth domain,
+//      and cross-origin popup messaging is blocked on mobile browsers.
+//
+// REDIRECT FLOW:
+//   User taps button → signInWithRedirect() → browser navigates to Google
+//   → Google redirects back to your page → getRedirectResult() resolves
+//   → onAuthStateChanged fires with the user → app boots normally.
+// ═══════════════════════════════════════════════════════════════════════
 
-import { initializeApp }                           from "https://www.gstatic.com/firebasejs/12.0.0/firebase-app.js";
+import { initializeApp }
+  from "https://www.gstatic.com/firebasejs/12.0.0/firebase-app.js";
 import { getFirestore, doc, setDoc, getDoc, getDocs, collection }
-                                                   from "https://www.gstatic.com/firebasejs/12.0.0/firebase-firestore.js";
+  from "https://www.gstatic.com/firebasejs/12.0.0/firebase-firestore.js";
 import {
   getAuth,
   GoogleAuthProvider,
-  signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   signOut,
   onAuthStateChanged
 } from "https://www.gstatic.com/firebasejs/12.0.0/firebase-auth.js";
 
+// ── CONFIG ────────────────────────────────────────────────────────────
 const firebaseConfig = {
-  apiKey: "AIzaSyDpY0_uGYHNmPnBQr8panMa1Xivdzj6bY",
-  authDomain: "nafs-tracker-bec0e.firebaseapp.com",
-  projectId: "nafs-tracker-bec0e",
-  storageBucket: "nafs-tracker-bec0e.firebasestorage.app",
+  apiKey:            "AIzaSyDpY0_uGYHNmPnBQr8panMa1Xivdzj6bY",
+  authDomain:        "nafs-tracker-bec0e.firebaseapp.com",
+  projectId:         "nafs-tracker-bec0e",
+  storageBucket:     "nafs-tracker-bec0e.firebasestorage.app",
   messagingSenderId: "381978394406",
-  appId: "1:381978394406:web:219099f338c62458064be7",
-  measurementId: "G-YK3H05DMEJ"
+  appId:             "1:381978394406:web:219099f338c62458064be7",
+  measurementId:     "G-YK3H05DMEJ"
 };
 
 const app  = initializeApp(firebaseConfig);
 const db   = getFirestore(app);
 const auth = getAuth(app);
 
-// ── CLOUD SYNC HELPERS ────────────────────────────────────────────────
-// Returns the UID of the currently signed-in user, or null.
+console.log("[Nafs Auth] Firebase initialised. SDK v12, auth domain:", firebaseConfig.authDomain);
+
+// ── CLOUD SYNC HELPERS ─────────────────────────────────────────────────
+// All Firestore paths are scoped to auth.currentUser.uid so every user
+// has completely separate data: nafs_users/{uid}/data/{key}
+
 function getCurrentUID() {
-  return auth.currentUser ? auth.currentUser.uid : null;
+  const uid = auth.currentUser ? auth.currentUser.uid : null;
+  if (!uid) console.warn("[Nafs Cloud] getCurrentUID called but no user signed in.");
+  return uid;
 }
 
 async function saveToCloud(key, value) {
   const uid = getCurrentUID();
-  if (!uid) return; // not signed in — skip cloud write
+  if (!uid) return;
   try {
     const safeKey = key.replace(/[^a-zA-Z0-9_\-]/g, "_");
-    await setDoc(doc(db, "nafs_users", uid, "data", safeKey), { value: JSON.stringify(value) });
+    await setDoc(
+      doc(db, "nafs_users", uid, "data", safeKey),
+      { value: JSON.stringify(value) }
+    );
+    console.log("[Nafs Cloud] Saved:", safeKey, "→ uid:", uid);
   } catch (e) {
-    console.warn("[Nafs Cloud] saveToCloud failed:", e.message);
+    console.error("[Nafs Cloud] saveToCloud failed:", e.code, e.message);
   }
 }
 
@@ -431,9 +462,12 @@ async function loadFromCloud(key) {
   try {
     const safeKey = key.replace(/[^a-zA-Z0-9_\-]/g, "_");
     const snap = await getDoc(doc(db, "nafs_users", uid, "data", safeKey));
-    if (snap.exists()) return JSON.parse(snap.data().value);
+    if (snap.exists()) {
+      console.log("[Nafs Cloud] Loaded:", safeKey);
+      return JSON.parse(snap.data().value);
+    }
   } catch (e) {
-    console.warn("[Nafs Cloud] loadFromCloud failed:", e.message);
+    console.error("[Nafs Cloud] loadFromCloud failed:", e.code, e.message);
   }
   return null;
 }
@@ -441,70 +475,148 @@ async function loadFromCloud(key) {
 async function loadAllFromCloud() {
   const uid = getCurrentUID();
   if (!uid) return;
+  console.log("[Nafs Cloud] Loading all data for uid:", uid);
   try {
     const snap = await getDocs(collection(db, "nafs_users", uid, "data"));
+    let count = 0;
     snap.forEach(docSnap => {
-      try { localStorage.setItem(docSnap.id, docSnap.data().value); } catch {}
+      try {
+        localStorage.setItem(docSnap.id, docSnap.data().value);
+        count++;
+      } catch (e) {
+        console.warn("[Nafs Cloud] localStorage write failed for key:", docSnap.id);
+      }
     });
-    console.log("[Nafs Cloud] All data loaded from Firestore ✓");
+    console.log(`[Nafs Cloud] Loaded ${count} keys from Firestore ✓`);
   } catch (e) {
-    console.warn("[Nafs Cloud] loadAllFromCloud failed (offline?):", e.message);
+    console.error("[Nafs Cloud] loadAllFromCloud failed:", e.code, e.message);
   }
 }
 
-// ── AUTH ACTIONS ──────────────────────────────────────────────────────
+// ── SIGN IN — REDIRECT FLOW ────────────────────────────────────────────
+// Step 1 of 2: called when user taps "Sign in with Google".
+// Navigates the entire page to Google's OAuth consent screen.
+// Control returns via getRedirectResult() below after the page reloads.
 async function signInWithGoogle() {
   try {
+    console.log("[Nafs Auth] Starting Google redirect sign-in...");
+    // Show a visual cue since the page is about to navigate away
+    window._nafsShowToast && window._nafsShowToast("Redirecting to Google…");
+
     const provider = new GoogleAuthProvider();
-    await signInWithPopup(auth, provider);
+    // Force account picker every time (good UX for shared devices)
+    provider.setCustomParameters({ prompt: "select_account" });
+
+    await signInWithRedirect(auth, provider);
+    // ↑ This line navigates the browser away. Code below does not run.
   } catch (e) {
-    console.warn("[Nafs Auth] signInWithGoogle failed:", e.message);
-    window._nafsShowToast && window._nafsShowToast("Sign-in failed. Try again.");
+    console.error("[Nafs Auth] signInWithRedirect failed:", e.code, e.message);
+    window._nafsShowToast && window._nafsShowToast("Sign-in failed: " + e.message);
   }
 }
 
+// ── SIGN OUT ───────────────────────────────────────────────────────────
 async function signOutUser() {
+  console.log("[Nafs Auth] Signing out uid:", getCurrentUID());
   try {
-    // Clear localStorage so data isn't leaked to the next user
+    // Clear localStorage so this user's data isn't visible to the next user
     const keys = [];
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
-      if (k && k.startsWith('nafs_')) keys.push(k);
+      if (k && k.startsWith("nafs_")) keys.push(k);
     }
     keys.forEach(k => localStorage.removeItem(k));
+    console.log("[Nafs Auth] Cleared", keys.length, "localStorage keys.");
     await signOut(auth);
+    console.log("[Nafs Auth] signOut complete.");
   } catch (e) {
-    console.warn("[Nafs Auth] signOut failed:", e.message);
+    console.error("[Nafs Auth] signOut failed:", e.code, e.message);
+    window._nafsShowToast && window._nafsShowToast("Sign-out failed. Try again.");
   }
 }
 
-// ── AUTH STATE LISTENER ───────────────────────────────────────────────
+// ── REDIRECT RESULT HANDLER ────────────────────────────────────────────
+// Step 2 of 2: called once on every page load.
+// If the page loaded as a result of a redirect from Google, this resolves
+// with the signed-in user. Otherwise it resolves with null (normal load).
+// Must be awaited BEFORE onAuthStateChanged is relied upon, because the
+// auth state update from a redirect result is async.
+async function handleRedirectResult() {
+  console.log("[Nafs Auth] Checking for pending redirect result...");
+  try {
+    const result = await getRedirectResult(auth);
+    if (result && result.user) {
+      console.log("[Nafs Auth] Redirect sign-in succeeded:", result.user.email, "uid:", result.user.uid);
+      // onAuthStateChanged will fire automatically; no manual action needed here.
+    } else {
+      console.log("[Nafs Auth] No pending redirect result (normal page load).");
+    }
+  } catch (e) {
+    // Common error codes:
+    //   auth/account-exists-with-different-credential — user has account via another provider
+    //   auth/popup-blocked — should not happen with redirect, but log it
+    //   auth/cancelled-popup-request — user cancelled on the Google page
+    //   auth/network-request-failed — offline
+    console.error("[Nafs Auth] getRedirectResult failed:", e.code, e.message);
+    window._nafsShowToast && window._nafsShowToast(
+      e.code === "auth/network-request-failed"
+        ? "No internet connection. Please try again."
+        : "Sign-in failed (" + e.code + "). Try again."
+    );
+  }
+}
+
+// ── AUTH STATE LISTENER ────────────────────────────────────────────────
+// Fires on page load (persisted session), after redirect result resolves,
+// and whenever sign-in / sign-out is called.
 onAuthStateChanged(auth, async (user) => {
+  console.log("[Nafs Auth] onAuthStateChanged →", user ? "SIGNED IN: " + user.email : "SIGNED OUT");
   window._nafsCurrentUser = user || null;
+
   if (user) {
-    // User just signed in — load their cloud data then re-render
+    // Load this user's Firestore data into localStorage (4 s timeout for offline)
     try {
       await Promise.race([
         loadAllFromCloud(),
         new Promise(res => setTimeout(res, 4000))
       ]);
-    } catch {}
-    window._nafsOnAuthReady && window._nafsOnAuthReady(user);
+    } catch (e) {
+      console.warn("[Nafs Auth] Cloud load timed out or failed, continuing with local data.");
+    }
+  }
+
+  // Hand off to the UI layer
+  if (typeof window._nafsOnAuthReady === "function") {
+    window._nafsOnAuthReady(user || null);
   } else {
-    window._nafsOnAuthReady && window._nafsOnAuthReady(null);
+    // _nafsOnAuthReady not yet defined (race condition on very fast loads);
+    // retry once the non-module script has had a tick to register it.
+    console.warn("[Nafs Auth] _nafsOnAuthReady not yet registered, retrying in 100 ms...");
+    setTimeout(() => {
+      if (typeof window._nafsOnAuthReady === "function") {
+        window._nafsOnAuthReady(user || null);
+      } else {
+        console.error("[Nafs Auth] _nafsOnAuthReady still not found. UI will not update.");
+      }
+    }, 100);
   }
 });
 
-// Expose to global scope
+// ── BOOT: check for redirect result immediately on load ────────────────
+// This must run before any UI decision is made. getRedirectResult()
+// consumes the pending credential from sessionStorage so it only fires once.
+handleRedirectResult();
+
+// ── EXPOSE TO GLOBAL SCOPE ─────────────────────────────────────────────
 window._nafsDb             = db;
 window._nafsAuth           = auth;
 window._nafsSaveToCloud    = saveToCloud;
 window._nafsLoadFromCloud  = loadFromCloud;
 window._nafsLoadAll        = loadAllFromCloud;
-window._nafsSignIn         = signInWithGoogle;
-window._nafsSignOut        = signOutUser;
+window._nafsSignIn         = signInWithGoogle;   // called by UI buttons
+window._nafsSignOut        = signOutUser;        // called by UI buttons
 
-console.log("Firebase + Firestore + Auth Connected");
+console.log("[Nafs Auth] Module ready. Waiting for auth state...");
 </script></head>
 <body>
 
@@ -792,7 +904,7 @@ console.log("Firebase + Firestore + Auth Connected");
         Sign in to sync your habits across devices and keep your data backed up securely.
       </p>
       <button id="settings-google-signin-btn"
-        onclick="window._nafsSignIn && window._nafsSignIn()"
+        onclick="handleAuthBtnClick()"
         style="width:100%;display:flex;align-items:center;justify-content:center;gap:12px;
                padding:13px 20px;border-radius:11px;
                background:#fff;color:#1f2937;
@@ -866,13 +978,17 @@ console.log("Firebase + Firestore + Auth Connected");
     <div style="font-size:14px;color:#7a8099;margin-bottom:32px;line-height:1.5;">
       Your personal self-improvement tracker.<br>Sign in to sync your data across devices.
     </div>
-    <button id="google-signin-btn" onclick="window._nafsSignIn && window._nafsSignIn()" style="
-      width:100%;display:flex;align-items:center;justify-content:center;gap:12px;
-      padding:14px 20px;border-radius:12px;
-      background:#fff;color:#1f2937;
-      border:none;font-size:15px;font-weight:700;cursor:pointer;
-      transition:filter .15s;font-family:inherit;
-    " onmouseover="this.style.filter='brightness(0.94)'" onmouseout="this.style.filter='brightness(1)'">
+
+    <!-- Sign-in button — default state -->
+    <button id="auth-google-btn"
+      onclick="handleAuthBtnClick()"
+      style="width:100%;display:flex;align-items:center;justify-content:center;gap:12px;
+             padding:14px 20px;border-radius:12px;
+             background:#fff;color:#1f2937;
+             border:none;font-size:15px;font-weight:700;cursor:pointer;
+             transition:filter .15s,opacity .15s;font-family:inherit;"
+      onmouseover="this.style.filter='brightness(0.94)'"
+      onmouseout="this.style.filter='brightness(1)'">
       <svg width="20" height="20" viewBox="0 0 48 48">
         <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
         <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
@@ -880,13 +996,57 @@ console.log("Firebase + Firestore + Auth Connected");
         <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
         <path fill="none" d="M0 0h48v48H0z"/>
       </svg>
-      Continue with Google
+      <span id="auth-btn-label">Continue with Google</span>
     </button>
+
+    <!-- Redirecting state (shown while navigating away) -->
+    <div id="auth-redirecting" style="display:none;margin-top:20px;font-size:13px;color:#7a8099;">
+      <div style="display:inline-block;width:16px;height:16px;border:2px solid #3a4055;
+                  border-top-color:#818cf8;border-radius:50%;
+                  animation:spin .7s linear infinite;vertical-align:middle;margin-right:8px;"></div>
+      Redirecting to Google…
+    </div>
+
     <p style="font-size:11px;color:#3a4055;margin-top:20px;">
       Your data is private and tied to your Google account.
     </p>
   </div>
 </div>
+
+<style>
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+
+<script>
+// Handles the login button click on the auth screen.
+// Disables the button immediately (prevents double-tap) and shows the
+// redirecting spinner. _nafsSignIn() navigates away so this state
+// is only visible for ~0.5 s before the browser leaves the page.
+function handleAuthBtnClick() {
+  const btn = document.getElementById('auth-google-btn');
+  const label = document.getElementById('auth-btn-label');
+  const redirecting = document.getElementById('auth-redirecting');
+  if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; btn.style.cursor = 'not-allowed'; }
+  if (label) label.textContent = 'Connecting…';
+  if (redirecting) redirecting.style.display = 'block';
+  if (typeof window._nafsSignIn === 'function') {
+    window._nafsSignIn();
+  } else {
+    // Module not loaded yet — retry after a short delay
+    console.warn("[Nafs Auth] _nafsSignIn not ready, retrying in 300 ms...");
+    setTimeout(() => {
+      if (typeof window._nafsSignIn === 'function') {
+        window._nafsSignIn();
+      } else {
+        console.error("[Nafs Auth] _nafsSignIn still not available.");
+        if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.style.cursor = 'pointer'; }
+        if (label) label.textContent = 'Continue with Google';
+        if (redirecting) redirecting.style.display = 'none';
+      }
+    }, 300);
+  }
+}
+</script>
 
 <div id="toast"></div>
 
